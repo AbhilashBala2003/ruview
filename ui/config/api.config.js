@@ -57,9 +57,9 @@ export const API_CONFIG = {
       DISCONNECT_CLIENT: '/api/v1/stream/clients/{client_id}',
       BROADCAST: '/api/v1/stream/broadcast',
       METRICS: '/api/v1/stream/metrics',
-      // WebSocket endpoints
+      // WebSocket endpoints — both served on the HTTP port (same port as the UI)
       WS_POSE: '/api/v1/stream/pose',
-      WS_EVENTS: '/api/v1/stream/events'
+      WS_EVENTS: '/ws/events'
     },
     
     // Development (only in dev mode)

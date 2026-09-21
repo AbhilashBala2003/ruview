@@ -51,8 +51,9 @@ export class TrainingService {
       this.emit('training-started', data);
       return data;
     } catch (error) {
-      this.logger.error('Failed to start training', { error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to start training', { error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -63,8 +64,9 @@ export class TrainingService {
       this.emit('training-stopped', data);
       return data;
     } catch (error) {
-      this.logger.error('Failed to stop training', { error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to stop training', { error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -73,8 +75,9 @@ export class TrainingService {
       const data = await apiService.get('/api/v1/train/status');
       return data;
     } catch (error) {
-      this.logger.error('Failed to get training status', { error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to get training status', { error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -85,8 +88,9 @@ export class TrainingService {
       this.emit('training-started', data);
       return data;
     } catch (error) {
-      this.logger.error('Failed to start pretraining', { error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to start pretraining', { error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -97,8 +101,9 @@ export class TrainingService {
       this.emit('training-started', data);
       return data;
     } catch (error) {
-      this.logger.error('Failed to start LoRA training', { error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to start LoRA training', { error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -109,8 +114,9 @@ export class TrainingService {
       const data = await apiService.get('/api/v1/recording/list');
       return data?.recordings ?? [];
     } catch (error) {
-      this.logger.error('Failed to list recordings', { error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to list recordings', { error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -121,8 +127,9 @@ export class TrainingService {
       this.emit('recording-started', data);
       return data;
     } catch (error) {
-      this.logger.error('Failed to start recording', { error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to start recording', { error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -133,8 +140,9 @@ export class TrainingService {
       this.emit('recording-stopped', data);
       return data;
     } catch (error) {
-      this.logger.error('Failed to stop recording', { error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to stop recording', { error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -146,8 +154,9 @@ export class TrainingService {
       );
       return data;
     } catch (error) {
-      this.logger.error('Failed to delete recording', { id, error: error.message });
-      throw error;
+      const msg = (error instanceof Error) ? error.message : JSON.stringify(error);
+      this.logger.error('Failed to delete recording', { id, error: msg });
+      throw (error instanceof Error) ? error : new Error(msg);
     }
   }
 
@@ -178,9 +187,12 @@ export class TrainingService {
       }
     };
 
-    ws.onerror = (error) => {
-      this.logger.error('Progress stream error', { error });
-      this.emit('progress-error', { error });
+    ws.onerror = (event) => {
+      // The WebSocket onerror callback receives a DOM Event, not a JS Error.
+      // Extracting a meaningful string prevents "[object Object]" in logs.
+      const msg = (event && event.message) ? event.message : 'WebSocket connection failed';
+      this.logger.error('Progress stream error', { error: msg });
+      this.emit('progress-error', { error: new Error(msg) });
     };
 
     ws.onclose = () => {

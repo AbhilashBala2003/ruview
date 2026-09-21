@@ -1,718 +1,389 @@
-// Pose Renderer Utility for WiFi-DensePose UI
+/**
+ * PoseRenderer — WiFi-DensePose skeleton & keypoint renderer
+ * Rewritten v2 (2026-07-10): direct canvas 2D calls, no gradient state bugs,
+ * handles confidence=0.0 ESP32 signal-derived keypoints correctly.
+ */
+
+// COCO-17 skeleton connections  [from, to]
+const SKELETON = [
+  [15, 13], [13, 11], [16, 14], [14, 12], [11, 12],  // lower-body
+  [5, 11],  [6, 12],  [5, 6],                          // torso
+  [5, 7],   [6, 8],   [7, 9],   [8, 10],               // arms
+  [11, 13], [12, 14], [13, 15], [14, 16]               // legs
+];
+
+// Per-segment colours (index matches SKELETON array)
+const SEG_COLORS = [
+  '#ff6b6b','#ff6b6b','#ff6b6b','#ff6b6b','#ff6b6b',  // lower-body: red
+  '#4ecdc4','#4ecdc4','#4ecdc4',                        // torso: teal
+  '#ffe66d','#ffe66d','#ffe66d','#ffe66d',              // arms: yellow
+  '#a29bfe','#a29bfe','#a29bfe','#a29bfe'              // legs: purple
+];
+
+// Per-keypoint colours (COCO-17 order)
+const KP_COLORS = [
+  '#ff6b6b',  // 0  nose
+  '#ff9ff3',  // 1  left_eye
+  '#ff9ff3',  // 2  right_eye
+  '#ffeaa7',  // 3  left_ear
+  '#ffeaa7',  // 4  right_ear
+  '#74b9ff',  // 5  left_shoulder
+  '#0984e3',  // 6  right_shoulder
+  '#55efc4',  // 7  left_elbow
+  '#00b894',  // 8  right_elbow
+  '#fdcb6e',  // 9  left_wrist
+  '#e17055',  // 10 right_wrist
+  '#a29bfe',  // 11 left_hip
+  '#6c5ce7',  // 12 right_hip
+  '#fd79a8',  // 13 left_knee
+  '#e84393',  // 14 right_knee
+  '#81ecec',  // 15 left_ankle
+  '#00cec9'   // 16 right_ankle
+];
+
+// Person colours for multi-person
+const PERSON_COLORS = ['#00e676','#40c4ff','#ff6d00','#ea80fc','#ffff00'];
 
 export class PoseRenderer {
   constructor(canvas, options = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.config = {
-      // Rendering modes
-      mode: 'skeleton', // 'skeleton', 'keypoints', 'heatmap', 'dense'
-      
-      // Visual settings
+      mode: 'skeleton',
       showKeypoints: true,
       showSkeleton: true,
       showBoundingBox: false,
       showConfidence: true,
       showZones: true,
       showDebugInfo: false,
-      
-      // Colors
       skeletonColor: '#00ff00',
       keypointColor: '#ff0000',
       boundingBoxColor: '#0000ff',
       confidenceColor: '#ffffff',
       zoneColor: '#ffff00',
-      
-      // Sizes
-      keypointRadius: 4,
-      skeletonWidth: 2,
+      keypointRadius: 5,
+      skeletonWidth: 3,
       boundingBoxWidth: 2,
       fontSize: 12,
-      
-      // Thresholds
-      confidenceThreshold: 0.3,
-      keypointConfidenceThreshold: 0.1,
-      
-      // Performance
+      // -1 means ALL keypoints render regardless of confidence value
+      confidenceThreshold: 0.0,
+      keypointConfidenceThreshold: -1,
       enableSmoothing: true,
       maxFps: 30,
-      
       ...options
     };
-    
-    this.logger = this.createLogger();
-    this.performanceMetrics = {
-      frameCount: 0,
-      lastFrameTime: 0,
-      averageFps: 0,
-      renderTime: 0
-    };
-    
-    // Pose skeleton connections (COCO format, 0-indexed)
-    this.skeletonConnections = [
-      [15, 13], [13, 11], [16, 14], [14, 12], [11, 12], // Head
-      [5, 11], [6, 12], [5, 6], // Torso
-      [5, 7], [6, 8], [7, 9], [8, 10], // Arms
-      [11, 13], [12, 14], [13, 15], [14, 16] // Legs
-    ];
-    
-    // Client-side keypoint smoothing: lerp between frames to reduce jitter.
-    // Maps person index → array of {x, y} for each keypoint.
-    this._smoothedKeypoints = new Map();
-    this._lerpAlpha = 0.25; // 0 = frozen, 1 = instant (no smoothing)
 
-    // Initialize rendering context
-    this.initializeContext();
+    this.performanceMetrics = { frameCount: 0, lastFrameTime: 0, averageFps: 0, renderTime: 0 };
+
+    // EMA smoothing state: personIdx → [{x,y}]
+    this._smooth = new Map();
+    this._alpha = 0.3; // lerp weight toward new position
+
+    this._initCtx();
   }
 
-  // Lerp a single value toward target
-  _lerp(current, target, alpha) {
-    return current + (target - current) * alpha;
-  }
-
-  // Get smoothed keypoint positions for a person
-  _getSmoothedKeypoints(personIdx, keypoints) {
-    if (!this.config.enableSmoothing || !keypoints || keypoints.length === 0) {
-      return keypoints;
-    }
-
-    let prev = this._smoothedKeypoints.get(personIdx);
-    if (!prev || prev.length !== keypoints.length) {
-      // First frame or keypoint count changed — initialize
-      prev = keypoints.map(kp => ({ x: kp.x, y: kp.y, z: kp.z || 0, confidence: kp.confidence, name: kp.name }));
-      this._smoothedKeypoints.set(personIdx, prev);
-      return keypoints;
-    }
-
-    const alpha = this._lerpAlpha;
-    const smoothed = keypoints.map((kp, i) => ({
-      ...kp,
-      x: this._lerp(prev[i].x, kp.x, alpha),
-      y: this._lerp(prev[i].y, kp.y, alpha),
-    }));
-
-    // Update stored positions
-    this._smoothedKeypoints.set(personIdx, smoothed.map(kp => ({ x: kp.x, y: kp.y, z: kp.z || 0, confidence: kp.confidence, name: kp.name })));
-
-    return smoothed;
-  }
-
-  createLogger() {
-    return {
-      debug: (...args) => console.debug('[RENDERER-DEBUG]', new Date().toISOString(), ...args),
-      info: (...args) => console.info('[RENDERER-INFO]', new Date().toISOString(), ...args),
-      warn: (...args) => console.warn('[RENDERER-WARN]', new Date().toISOString(), ...args),
-      error: (...args) => console.error('[RENDERER-ERROR]', new Date().toISOString(), ...args)
-    };
-  }
-
-  initializeContext() {
-    this.ctx.imageSmoothingEnabled = this.config.enableSmoothing;
-    this.ctx.font = `${this.config.fontSize}px Arial`;
+  _initCtx() {
+    this.ctx.imageSmoothingEnabled = true;
+    this.ctx.font = `${this.config.fontSize}px monospace`;
     this.ctx.textAlign = 'left';
     this.ctx.textBaseline = 'top';
   }
 
-  // Main render method
+  // ── Public API ─────────────────────────────────────────────────────────────
+
   render(poseData, metadata = {}) {
-    const startTime = performance.now();
-    
-    try {
-      // Clear canvas
-      this.clearCanvas();
-      
-      console.log('🎨 [RENDERER] Rendering pose data:', poseData);
-      
-      if (!poseData || !poseData.persons) {
-        console.log('⚠️ [RENDERER] No pose data or persons array');
-        this.renderNoDataMessage();
-        return;
-      }
-      
-      console.log(`👥 [RENDERER] Found ${poseData.persons.length} persons to render`);
+    const t0 = performance.now();
+    this.clearCanvas();
 
-      // Render based on mode
-      switch (this.config.mode) {
-        case 'skeleton':
-          this.renderSkeletonMode(poseData, metadata);
-          break;
-        case 'keypoints':
-          this.renderKeypointsMode(poseData, metadata);
-          break;
-        case 'heatmap':
-          this.renderHeatmapMode(poseData, metadata);
-          break;
-        case 'dense':
-          this.renderDenseMode(poseData, metadata);
-          break;
-        default:
-          this.renderSkeletonMode(poseData, metadata);
-      }
-
-      // Render debug information if enabled
-      if (this.config.showDebugInfo) {
-        this.renderDebugInfo(poseData, metadata);
-      }
-
-      // Update performance metrics
-      this.updatePerformanceMetrics(startTime);
-      
-    } catch (error) {
-      this.logger.error('Render error', { error: error.message });
-      this.renderErrorMessage(error.message);
+    if (!poseData || !Array.isArray(poseData.persons) || poseData.persons.length === 0) {
+      this._noData();
+      return;
     }
+
+    const mode = this.config.mode || 'skeleton';
+
+    poseData.persons.forEach((person, idx) => {
+      if (!person) return;
+      // Accept person-level confidence=0 (signal-derived) — only skip if
+      // explicitly below the threshold (default 0.0, so nothing is skipped).
+      if (typeof person.confidence === 'number' && person.confidence < this.config.confidenceThreshold) return;
+
+      const kps = this._smooth_kps(idx, person.keypoints);
+
+      if (mode === 'skeleton' || mode === 'keypoints' || mode === 'dense') {
+        if (this.config.showSkeleton && kps && kps.length > 0) this._drawSkeleton(kps, idx);
+        if (this.config.showKeypoints && kps && kps.length > 0) this._drawKeypoints(kps, idx);
+      } else if (mode === 'heatmap') {
+        if (kps && kps.length > 0) this._drawHeatmap(kps, idx);
+      }
+
+      if (this.config.showBoundingBox && person.bbox) this._drawBBox(person.bbox, idx);
+      if (this.config.showConfidence) this._drawLabel(person, idx, kps);
+    });
+
+    if (this.config.showZones && poseData.zone_summary) this._drawZones(poseData.zone_summary);
+    if (this.config.showDebugInfo) this._drawDebug(poseData);
+
+    this._updateFps(t0);
   }
 
   clearCanvas() {
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    
-    // Optional: Add background
-    if (this.config.backgroundColor) {
-      this.ctx.fillStyle = this.config.backgroundColor;
-      this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-    }
+    // Dark translucent background so content is always visible
+    this.ctx.fillStyle = 'rgba(10, 15, 25, 0.85)';
+    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
   }
 
-  // Skeleton rendering mode
-  renderSkeletonMode(poseData, metadata) {
-    const persons = poseData.persons || [];
-    
-    console.log(`🦴 [RENDERER] Skeleton mode: processing ${persons.length} persons`);
-    
-    persons.forEach((person, index) => {
-      console.log(`👤 [RENDERER] Person ${index}:`, person);
-      
-      if (person.confidence < this.config.confidenceThreshold) {
-        console.log(`❌ [RENDERER] Skipping person ${index} - low confidence: ${person.confidence} < ${this.config.confidenceThreshold}`);
-        return; // Skip low confidence detections
-      }
-
-      // Apply client-side lerp smoothing to reduce visual jitter
-      const smoothedKps = this._getSmoothedKeypoints(index, person.keypoints);
-
-      // Render skeleton connections
-      if (this.config.showSkeleton && smoothedKps) {
-        this.renderSkeleton(smoothedKps, person.confidence);
-      }
-
-      // Render keypoints
-      if (this.config.showKeypoints && smoothedKps) {
-        this.renderKeypoints(smoothedKps, person.confidence);
-      }
-
-      // Render bounding box
-      if (this.config.showBoundingBox && person.bbox) {
-        console.log(`📦 [RENDERER] Rendering bounding box for person ${index}`);
-        this.renderBoundingBox(person.bbox, person.confidence, index);
-      }
-
-      // Render confidence score
-      if (this.config.showConfidence) {
-        console.log(`📊 [RENDERER] Rendering confidence score for person ${index}`);
-        this.renderConfidenceScore(person, index);
-      }
-    });
-
-    // Render zones if available
-    if (this.config.showZones && poseData.zone_summary) {
-      this.renderZones(poseData.zone_summary);
-    }
+  resize(w, h) {
+    this.canvas.width  = Math.round(w);
+    this.canvas.height = Math.round(h);
+    this._initCtx();
   }
 
-  // Keypoints only mode — large colored dots with labels, no skeleton lines
-  renderKeypointsMode(poseData, metadata) {
-    const persons = poseData.persons || [];
+  setMode(mode) { this.config.mode = mode; }
+  updateConfig(c) { Object.assign(this.config, c); this._initCtx(); }
+  getPerformanceMetrics() { return { ...this.performanceMetrics }; }
+  getConfig() { return { ...this.config }; }
+  exportFrame(fmt = 'png') { try { return this.canvas.toDataURL(`image/${fmt}`); } catch { return null; } }
 
-    persons.forEach((person, index) => {
-      if (person.confidence >= this.config.confidenceThreshold && person.keypoints) {
-        this.renderKeypoints(person.keypoints, person.confidence, true);
+  // ── Coordinate scaling ─────────────────────────────────────────────────────
 
-        // Render bounding box
-        if (this.config.showBoundingBox && person.bbox) {
-          this.renderBoundingBox(person.bbox, person.confidence, index);
-        }
-        if (this.config.showConfidence) {
-          this.renderConfidenceScore(person, index);
-        }
-      }
-    });
-
-    if (this.config.showZones && poseData.zone_summary) {
-      this.renderZones(poseData.zone_summary);
-    }
-  }
-
-  // Heatmap rendering mode — Gaussian blobs around each keypoint
-  renderHeatmapMode(poseData, metadata) {
-    const persons = poseData.persons || [];
-
-    persons.forEach((person, personIdx) => {
-      if (person.confidence < this.config.confidenceThreshold || !person.keypoints) return;
-
-      const hue = (personIdx * 60) % 360; // different hue per person
-
-      person.keypoints.forEach((kp) => {
-        if (kp.confidence <= this.config.keypointConfidenceThreshold) return;
-
-        const cx = this.scaleX(kp.x);
-        const cy = this.scaleY(kp.y);
-        const radius = 30 + kp.confidence * 20;
-
-        const grad = this.ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
-        grad.addColorStop(0, `hsla(${hue}, 100%, 55%, ${kp.confidence * 0.7})`);
-        grad.addColorStop(0.5, `hsla(${hue}, 100%, 45%, ${kp.confidence * 0.3})`);
-        grad.addColorStop(1, `hsla(${hue}, 100%, 40%, 0)`);
-
-        this.ctx.fillStyle = grad;
-        this.ctx.fillRect(cx - radius, cy - radius, radius * 2, radius * 2);
-      });
-
-      // Light skeleton overlay so joints are connected
-      if (person.keypoints) {
-        this.ctx.globalAlpha = 0.25;
-        this.renderSkeleton(person.keypoints, person.confidence);
-        this.ctx.globalAlpha = 1.0;
-      }
-
-      if (this.config.showConfidence) {
-        this.renderConfidenceScore(person, personIdx);
-      }
-    });
-
-    if (this.config.showZones && poseData.zone_summary) {
-      this.renderZones(poseData.zone_summary);
-    }
-  }
-
-  // Dense pose rendering mode — body region segmentation with filled polygons
-  renderDenseMode(poseData, metadata) {
-    const persons = poseData.persons || [];
-
-    // Body part groups: [start_kp, end_kp, color]
-    const bodyParts = [
-      { name: 'head',      kps: [0, 1, 2, 3, 4],           color: 'rgba(255, 100, 100, 0.4)' },
-      { name: 'torso',     kps: [5, 6, 12, 11],             color: 'rgba(100, 200, 255, 0.4)' },
-      { name: 'left_arm',  kps: [5, 7, 9],                  color: 'rgba(100, 255, 150, 0.4)' },
-      { name: 'right_arm', kps: [6, 8, 10],                 color: 'rgba(255, 200, 100, 0.4)' },
-      { name: 'left_leg',  kps: [11, 13, 15],               color: 'rgba(200, 100, 255, 0.4)' },
-      { name: 'right_leg', kps: [12, 14, 16],               color: 'rgba(255, 255, 100, 0.4)' },
-    ];
-
-    persons.forEach((person, personIdx) => {
-      if (person.confidence < this.config.confidenceThreshold || !person.keypoints) return;
-
-      const kps = this._getSmoothedKeypoints(personIdx, person.keypoints);
-
-      bodyParts.forEach((part) => {
-        // Collect valid keypoints for this body part
-        const points = part.kps
-          .filter(i => kps[i] && kps[i].confidence > this.config.keypointConfidenceThreshold)
-          .map(i => ({ x: this.scaleX(kps[i].x), y: this.scaleY(kps[i].y) }));
-
-        if (points.length < 2) return;
-
-        // Draw filled region with padding around joints
-        this.ctx.fillStyle = part.color;
-        this.ctx.strokeStyle = part.color.replace('0.4', '0.7');
-        this.ctx.lineWidth = 8;
-        this.ctx.lineJoin = 'round';
-        this.ctx.lineCap = 'round';
-
-        // Draw thick path as a "region"
-        this.ctx.beginPath();
-        this.ctx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++) {
-          this.ctx.lineTo(points[i].x, points[i].y);
-        }
-        this.ctx.stroke();
-
-        // Draw circles at each joint to widen the region
-        points.forEach(p => {
-          this.ctx.beginPath();
-          this.ctx.arc(p.x, p.y, 10, 0, Math.PI * 2);
-          this.ctx.fill();
-        });
-      });
-
-      // Subtle keypoint dots on top
-      this.renderKeypoints(kps, person.confidence, false);
-
-      if (this.config.showConfidence) {
-        this.renderConfidenceScore(person, personIdx);
-      }
-    });
-
-    if (this.config.showZones && poseData.zone_summary) {
-      this.renderZones(poseData.zone_summary);
-    }
-  }
-
-  // Render skeleton connections
-  renderSkeleton(keypoints, confidence) {
-    this.skeletonConnections.forEach(([pointA, pointB]) => {
-      const keypointA = keypoints[pointA];
-      const keypointB = keypoints[pointB];
-
-      if (keypointA && keypointB && 
-          keypointA.confidence > this.config.keypointConfidenceThreshold &&
-          keypointB.confidence > this.config.keypointConfidenceThreshold) {
-        
-        const x1 = this.scaleX(keypointA.x);
-        const y1 = this.scaleY(keypointA.y);
-        const x2 = this.scaleX(keypointB.x);
-        const y2 = this.scaleY(keypointB.y);
-
-        // Calculate line confidence based on both keypoints
-        const lineConfidence = (keypointA.confidence + keypointB.confidence) / 2;
-        
-        // Variable line width based on confidence
-        const lineWidth = this.config.skeletonWidth + (lineConfidence - 0.5) * 2;
-        this.ctx.lineWidth = Math.max(1, Math.min(4, lineWidth));
-        
-        // Create gradient along the line
-        const gradient = this.ctx.createLinearGradient(x1, y1, x2, y2);
-        const colorA = this.addAlphaToColor(this.config.skeletonColor, keypointA.confidence);
-        const colorB = this.addAlphaToColor(this.config.skeletonColor, keypointB.confidence);
-        gradient.addColorStop(0, colorA);
-        gradient.addColorStop(1, colorB);
-        
-        this.ctx.strokeStyle = gradient;
-        this.ctx.globalAlpha = Math.min(confidence * 1.2, 1.0);
-        
-        // Add subtle glow for high confidence connections
-        if (lineConfidence > 0.8) {
-          this.ctx.shadowColor = this.config.skeletonColor;
-          this.ctx.shadowBlur = 3;
-        }
-
-        this.ctx.beginPath();
-        this.ctx.moveTo(x1, y1);
-        this.ctx.lineTo(x2, y2);
-        this.ctx.stroke();
-        
-        // Reset shadow
-        this.ctx.shadowBlur = 0;
-      }
-    });
-
-    this.ctx.globalAlpha = 1.0;
-  }
-
-  // Render keypoints
-  renderKeypoints(keypoints, confidence, enhancedMode = false) {
-    keypoints.forEach((keypoint, index) => {
-      if (keypoint.confidence > this.config.keypointConfidenceThreshold) {
-        const x = this.scaleX(keypoint.x);
-        const y = this.scaleY(keypoint.y);
-        
-        // Calculate radius based on confidence and keypoint importance
-        const baseRadius = this.config.keypointRadius;
-        const confidenceRadius = baseRadius + (keypoint.confidence - 0.5) * 2;
-        const radius = Math.max(2, Math.min(8, confidenceRadius));
-        
-        // Set color based on keypoint type or confidence
-        if (enhancedMode) {
-          this.ctx.fillStyle = this.getKeypointColor(index, keypoint.confidence);
-        } else {
-          this.ctx.fillStyle = this.config.keypointColor;
-        }
-        
-        // Add glow effect for high confidence keypoints
-        if (keypoint.confidence > 0.8) {
-          this.ctx.shadowColor = this.ctx.fillStyle;
-          this.ctx.shadowBlur = 6;
-          this.ctx.shadowOffsetX = 0;
-          this.ctx.shadowOffsetY = 0;
-        }
-        
-        this.ctx.globalAlpha = Math.min(1.0, keypoint.confidence + 0.3);
-        
-        // Draw keypoint with gradient
-        const gradient = this.ctx.createRadialGradient(x, y, 0, x, y, radius);
-        gradient.addColorStop(0, this.ctx.fillStyle);
-        gradient.addColorStop(1, this.addAlphaToColor(this.ctx.fillStyle, 0.3));
-        this.ctx.fillStyle = gradient;
-        
-        this.ctx.beginPath();
-        this.ctx.arc(x, y, radius, 0, 2 * Math.PI);
-        this.ctx.fill();
-        
-        // Reset shadow
-        this.ctx.shadowBlur = 0;
-
-        // Add keypoint labels in enhanced mode
-        if (enhancedMode && this.config.showDebugInfo) {
-          this.ctx.fillStyle = this.config.confidenceColor;
-          this.ctx.font = '10px Arial';
-          this.ctx.fillText(`${index}`, x + radius + 2, y - radius);
-        }
-      }
-    });
-
-    this.ctx.globalAlpha = 1.0;
-  }
-
-  // Render bounding box
-  renderBoundingBox(bbox, confidence, personIndex) {
-    const x = this.scaleX(bbox.x);
-    const y = this.scaleY(bbox.y);
-    const x2 = this.scaleX(bbox.x + bbox.width);
-    const y2 = this.scaleY(bbox.y + bbox.height);
-    const width = x2 - x;
-    const height = y2 - y;
-
-    this.ctx.strokeStyle = this.config.boundingBoxColor;
-    this.ctx.lineWidth = this.config.boundingBoxWidth;
-    this.ctx.globalAlpha = confidence;
-
-    this.ctx.strokeRect(x, y, width, height);
-
-    // Add person label
-    this.ctx.fillStyle = this.config.boundingBoxColor;
-    this.ctx.fillText(`Person ${personIndex + 1}`, x, y - 15);
-
-    this.ctx.globalAlpha = 1.0;
-  }
-
-  // Render confidence score
-  renderConfidenceScore(person, index) {
-    let x, y;
-    
-    if (person.bbox) {
-      x = this.scaleX(person.bbox.x);
-      y = this.scaleY(person.bbox.y + person.bbox.height) + 5;
-    } else if (person.keypoints && person.keypoints.length > 0) {
-      // Use first available keypoint
-      const firstKeypoint = person.keypoints.find(kp => kp.confidence > 0);
-      if (firstKeypoint) {
-        x = this.scaleX(firstKeypoint.x);
-        y = this.scaleY(firstKeypoint.y) + 20;
-      } else {
-        x = 10;
-        y = 30 + (index * 20);
-      }
-    } else {
-      x = 10;
-      y = 30 + (index * 20);
-    }
-
-    this.ctx.fillStyle = this.config.confidenceColor;
-    this.ctx.fillText(`Conf: ${(person.confidence * 100).toFixed(1)}%`, x, y);
-  }
-
-  // Render zones
-  renderZones(zoneSummary) {
-    Object.entries(zoneSummary).forEach(([zoneId, count], index) => {
-      const y = 10 + (index * 20);
-      
-      this.ctx.fillStyle = this.config.zoneColor;
-      this.ctx.fillText(`Zone ${zoneId}: ${count} person(s)`, 10, y);
-    });
-  }
-
-  // Render debug information
-  renderDebugInfo(poseData, metadata) {
-    const debugInfo = [
-      `Frame: ${poseData.frame_id || 'N/A'}`,
-      `Timestamp: ${poseData.timestamp || 'N/A'}`,
-      `Persons: ${poseData.persons?.length || 0}`,
-      `Processing: ${poseData.processing_time_ms || 0}ms`,
-      `FPS: ${this.performanceMetrics.averageFps.toFixed(1)}`,
-      `Render: ${this.performanceMetrics.renderTime.toFixed(1)}ms`
-    ];
-
-    const startY = this.canvas.height - (debugInfo.length * 15) - 10;
-    
-    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-    this.ctx.fillRect(5, startY - 5, 200, debugInfo.length * 15 + 10);
-    
-    this.ctx.fillStyle = '#ffffff';
-    debugInfo.forEach((info, index) => {
-      this.ctx.fillText(info, 10, startY + (index * 15));
-    });
-  }
-
-  // Render error message
-  renderErrorMessage(message) {
-    this.ctx.fillStyle = '#ff0000';
-    this.ctx.font = '16px Arial';
-    this.ctx.textAlign = 'center';
-    this.ctx.fillText(
-      `Render Error: ${message}`, 
-      this.canvas.width / 2, 
-      this.canvas.height / 2
-    );
-    this.ctx.textAlign = 'left';
-    this.ctx.font = `${this.config.fontSize}px Arial`;
-  }
-
-  // Render no data message
-  renderNoDataMessage() {
-    this.ctx.fillStyle = '#888888';
-    this.ctx.font = '16px Arial';
-    this.ctx.textAlign = 'center';
-    this.ctx.fillText(
-      'No pose data available', 
-      this.canvas.width / 2, 
-      this.canvas.height / 2
-    );
-    this.ctx.fillText(
-      'Click "Demo" to see test poses', 
-      this.canvas.width / 2, 
-      this.canvas.height / 2 + 25
-    );
-    this.ctx.textAlign = 'left';
-    this.ctx.font = `${this.config.fontSize}px Arial`;
-  }
-
-  // Test method to verify canvas is working
-  renderTestShape() {
-    console.log('🔧 [RENDERER] Rendering test shape');
-    this.clearCanvas();
-    
-    // Draw a test rectangle
-    this.ctx.fillStyle = '#ff0000';
-    this.ctx.fillRect(50, 50, 100, 100);
-    
-    // Draw a test circle
-    this.ctx.fillStyle = '#00ff00';
-    this.ctx.beginPath();
-    this.ctx.arc(250, 100, 50, 0, 2 * Math.PI);
-    this.ctx.fill();
-    
-    // Draw test text
-    this.ctx.fillStyle = '#0000ff';
-    this.ctx.font = '16px Arial';
-    this.ctx.fillText('Canvas Test', 50, 200);
-    
-    console.log('✅ [RENDERER] Test shape rendered');
-  }
-
-  // Utility methods
+  /**
+   * scaleX — map a server x-coordinate to canvas pixels.
+   * Server sends values in an 800-pixel-wide coordinate space.
+   * Values ≤ 1.0 are treated as normalised [0,1].
+   */
   scaleX(x) {
-    // If x is already in pixel coordinates (> 1), assume it's in the range 0-800
-    // If x is normalized (0-1), scale to canvas width
-    if (x > 1) {
-      // Assume original image width of 800 pixels
-      return (x / 800) * this.canvas.width;
-    } else {
-      return x * this.canvas.width;
-    }
+    if (x == null || isNaN(x)) return this.canvas.width / 2;
+    return x > 1 ? (x / 800) * this.canvas.width : x * this.canvas.width;
   }
 
   scaleY(y) {
-    // If y is already in pixel coordinates (> 1), assume it's in the range 0-600
-    // If y is normalized (0-1), scale to canvas height
-    if (y > 1) {
-      // Assume original image height of 600 pixels
-      return (y / 600) * this.canvas.height;
-    } else {
-      return y * this.canvas.height;
-    }
+    if (y == null || isNaN(y)) return this.canvas.height / 2;
+    return y > 1 ? (y / 600) * this.canvas.height : y * this.canvas.height;
   }
 
-  getKeypointColor(index, confidence) {
-    // Color based on body part
-    const colors = [
-      '#ff0000', '#ff4500', '#ffa500', '#ffff00', '#adff2f', // Head/neck
-      '#00ff00', '#00ff7f', '#00ffff', '#0080ff', '#0000ff', // Torso
-      '#4000ff', '#8000ff', '#ff00ff', '#ff0080', '#ff0040', // Arms
-      '#ff8080', '#ffb380', '#ffe680'  // Legs
-    ];
-    
-    const color = colors[index % colors.length];
-    const alpha = Math.floor(confidence * 255).toString(16).padStart(2, '0');
-    return color + alpha;
+  // ── Keypoint smoothing ─────────────────────────────────────────────────────
+
+  _smooth_kps(personIdx, kps) {
+    if (!kps || kps.length === 0) return kps;
+    if (!this.config.enableSmoothing) return kps;
+
+    const prev = this._smooth.get(personIdx);
+    if (!prev || prev.length !== kps.length) {
+      this._smooth.set(personIdx, kps.map(k => ({ x: k.x, y: k.y })));
+      return kps;
+    }
+
+    const a = this._alpha;
+    const out = kps.map((kp, i) => ({
+      ...kp,
+      x: prev[i].x + (kp.x - prev[i].x) * a,
+      y: prev[i].y + (kp.y - prev[i].y) * a,
+    }));
+    this._smooth.set(personIdx, out.map(k => ({ x: k.x, y: k.y })));
+    return out;
   }
 
-  addAlphaToColor(color, alpha) {
-    // Convert hex color to rgba
-    if (color.startsWith('#')) {
-      const hex = color.slice(1);
-      const r = parseInt(hex.slice(0, 2), 16);
-      const g = parseInt(hex.slice(2, 4), 16);
-      const b = parseInt(hex.slice(4, 6), 16);
-      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-    }
-    // If already rgba, modify alpha
-    if (color.startsWith('rgba')) {
-      return color.replace(/[\d\.]+\)$/g, `${alpha})`);
-    }
-    // If rgb, convert to rgba
-    if (color.startsWith('rgb')) {
-      return color.replace('rgb', 'rgba').replace(')', `, ${alpha})`);
-    }
-    return color;
+  // ── Drawing primitives ─────────────────────────────────────────────────────
+
+  _drawSkeleton(kps, personIdx) {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.lineWidth = this.config.skeletonWidth;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    SKELETON.forEach(([a, b], si) => {
+      const kpA = kps[a], kpB = kps[b];
+      if (!kpA || !kpB) return;
+
+      const x1 = this.scaleX(kpA.x), y1 = this.scaleY(kpA.y);
+      const x2 = this.scaleX(kpB.x), y2 = this.scaleY(kpB.y);
+
+      if (isNaN(x1) || isNaN(y1) || isNaN(x2) || isNaN(y2)) return;
+
+      const color = SEG_COLORS[si % SEG_COLORS.length];
+      ctx.strokeStyle = color;
+      ctx.shadowColor  = color;
+      ctx.shadowBlur   = 8;
+      ctx.globalAlpha  = 0.95;
+
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    });
+
+    ctx.restore();
   }
 
-  updatePerformanceMetrics(startTime) {
-    const currentTime = performance.now();
-    this.performanceMetrics.renderTime = currentTime - startTime;
-    this.performanceMetrics.frameCount++;
+  _drawKeypoints(kps, personIdx) {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.globalAlpha = 1.0;
 
-    if (this.performanceMetrics.lastFrameTime > 0) {
-      // Clamp to a minimum dt so consecutive frames within the same
-      // performance.now() tick don't yield Infinity (issue #519 Bug 2).
-      // 1 ms floor caps the displayed FPS at 1000 — far above any real
-      // render rate, but finite so the EMA stays well-defined.
-      const deltaTime = Math.max(currentTime - this.performanceMetrics.lastFrameTime, 1);
-      const fps = 1000 / deltaTime;
+    kps.forEach((kp, i) => {
+      if (!kp) return;
+      const x = this.scaleX(kp.x), y = this.scaleY(kp.y);
+      if (isNaN(x) || isNaN(y)) return;
 
-      // Update average FPS using exponential moving average
-      if (this.performanceMetrics.averageFps === 0) {
-        this.performanceMetrics.averageFps = fps;
-      } else {
-        this.performanceMetrics.averageFps =
-          (this.performanceMetrics.averageFps * 0.9) + (fps * 0.1);
+      const r = this.config.keypointRadius;
+      const color = KP_COLORS[i % KP_COLORS.length];
+
+      // Outer glow ring
+      ctx.shadowColor = color;
+      ctx.shadowBlur  = 10;
+      ctx.fillStyle   = color;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+
+      // White inner dot
+      ctx.shadowBlur = 0;
+      ctx.fillStyle  = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(1.5, r - 2.5), 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    ctx.restore();
+  }
+
+  _drawHeatmap(kps, personIdx) {
+    const ctx = this.ctx;
+    const hue = personIdx * 60;
+    ctx.save();
+
+    kps.forEach((kp) => {
+      if (!kp) return;
+      const cx = this.scaleX(kp.x), cy = this.scaleY(kp.y);
+      if (isNaN(cx) || isNaN(cy)) return;
+      const r = 35;
+      const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+      g.addColorStop(0,   `hsla(${hue},100%,60%,0.6)`);
+      g.addColorStop(0.5, `hsla(${hue},100%,50%,0.25)`);
+      g.addColorStop(1,   `hsla(${hue},100%,40%,0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    ctx.restore();
+    // Overlay skeleton at reduced opacity
+    ctx.save();
+    ctx.globalAlpha = 0.4;
+    this._drawSkeleton(kps, personIdx);
+    ctx.restore();
+  }
+
+  _drawBBox(bbox, personIdx) {
+    if (!bbox) return;
+    const ctx = this.ctx;
+    const x = this.scaleX(bbox.x), y = this.scaleY(bbox.y);
+    const w = this.scaleX(bbox.x + (bbox.width  || 0)) - x;
+    const h = this.scaleY(bbox.y + (bbox.height || 0)) - y;
+    if (isNaN(x) || isNaN(y) || isNaN(w) || isNaN(h)) return;
+
+    ctx.save();
+    ctx.strokeStyle = PERSON_COLORS[personIdx % PERSON_COLORS.length];
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.7;
+    ctx.strokeRect(x, y, w, h);
+    ctx.restore();
+  }
+
+  _drawLabel(person, idx, kps) {
+    const ctx = this.ctx;
+    let lx = 12, ly = 20 + idx * 24;
+
+    // Anchor to nose keypoint if available
+    if (kps && kps[0]) {
+      const nx = this.scaleX(kps[0].x), ny = this.scaleY(kps[0].y);
+      if (!isNaN(nx) && !isNaN(ny) && nx > 0 && ny > 0) {
+        lx = nx;
+        ly = Math.max(14, ny - 14);
       }
     }
 
-    this.performanceMetrics.lastFrameTime = currentTime;
+    const label = `P${idx + 1} ${Math.round((person.confidence || 0) * 100)}%`;
+    ctx.save();
+    ctx.font        = 'bold 12px monospace';
+    ctx.shadowColor = '#000';
+    ctx.shadowBlur  = 4;
+    ctx.fillStyle   = PERSON_COLORS[idx % PERSON_COLORS.length];
+    ctx.globalAlpha = 1.0;
+    ctx.fillText(label, lx, ly);
+    ctx.restore();
   }
 
-  // Configuration methods
-  updateConfig(newConfig) {
-    this.config = { ...this.config, ...newConfig };
-    this.initializeContext();
-    this.logger.debug('Renderer configuration updated', { config: this.config });
+  _drawZones(zoneSummary) {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.font      = '11px monospace';
+    ctx.fillStyle = '#ffd700';
+    ctx.globalAlpha = 0.9;
+    ctx.shadowColor = '#000';
+    ctx.shadowBlur  = 3;
+    Object.entries(zoneSummary).forEach(([zone, count], i) => {
+      ctx.fillText(`Zone ${zone}: ${count} person(s)`, 10, 12 + i * 16);
+    });
+    ctx.restore();
   }
 
-  setMode(mode) {
-    this.config.mode = mode;
-    this.logger.info('Render mode changed', { mode });
+  _drawDebug(poseData) {
+    const ctx = this.ctx;
+    const lines = [
+      `frame: ${poseData.frame_id || '—'}`,
+      `persons: ${poseData.persons?.length || 0}`,
+      `fps: ${this.performanceMetrics.averageFps.toFixed(1)}`,
+      `render: ${this.performanceMetrics.renderTime.toFixed(1)}ms`,
+      `canvas: ${this.canvas.width}×${this.canvas.height}`
+    ];
+    const bh = lines.length * 14 + 8;
+    const bw = 160;
+    const bx = this.canvas.width - bw - 6;
+    const by = this.canvas.height - bh - 6;
+
+    ctx.save();
+    ctx.fillStyle   = 'rgba(0,0,0,0.65)';
+    ctx.globalAlpha = 1;
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = '#aaa';
+    ctx.font      = '11px monospace';
+    lines.forEach((l, i) => ctx.fillText(l, bx + 4, by + 4 + i * 14));
+    ctx.restore();
   }
 
-  // Utility methods for external access
-  getPerformanceMetrics() {
-    return { ...this.performanceMetrics };
+  _noData() {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.font      = '15px monospace';
+    ctx.fillStyle = '#556';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for pose data…', this.canvas.width / 2, this.canvas.height / 2);
+    ctx.fillText('Click  ▶ Start  to connect', this.canvas.width / 2, this.canvas.height / 2 + 22);
+    ctx.restore();
   }
 
-  getConfig() {
-    return { ...this.config };
-  }
-
-  // Resize handling
-  resize(width, height) {
-    this.canvas.width = width;
-    this.canvas.height = height;
-    this.initializeContext();
-    this.logger.debug('Canvas resized', { width, height });
-  }
-
-  // Export frame as image
-  exportFrame(format = 'png') {
-    try {
-      return this.canvas.toDataURL(`image/${format}`);
-    } catch (error) {
-      this.logger.error('Failed to export frame', { error: error.message });
-      return null;
+  _updateFps(t0) {
+    const now = performance.now();
+    this.performanceMetrics.renderTime  = now - t0;
+    this.performanceMetrics.frameCount++;
+    if (this.performanceMetrics.lastFrameTime > 0) {
+      const dt  = Math.max(now - this.performanceMetrics.lastFrameTime, 1);
+      const fps = 1000 / dt;
+      this.performanceMetrics.averageFps = this.performanceMetrics.averageFps === 0
+        ? fps
+        : this.performanceMetrics.averageFps * 0.9 + fps * 0.1;
     }
+    this.performanceMetrics.lastFrameTime = now;
   }
 }
 
-// Static utility methods
+// Kept for compatibility
 export const PoseRendererUtils = {
-  // Create default configuration
   createDefaultConfig: () => ({
     mode: 'skeleton',
     showKeypoints: true,
@@ -721,37 +392,15 @@ export const PoseRendererUtils = {
     showConfidence: true,
     showZones: true,
     showDebugInfo: false,
-    skeletonColor: '#00ff00',
-    keypointColor: '#ff0000',
-    boundingBoxColor: '#0000ff',
-    confidenceColor: '#ffffff',
-    zoneColor: '#ffff00',
-    keypointRadius: 4,
-    skeletonWidth: 2,
-    boundingBoxWidth: 2,
-    fontSize: 12,
-    confidenceThreshold: 0.3,
-    keypointConfidenceThreshold: 0.1,
+    keypointRadius: 5,
+    skeletonWidth: 3,
+    confidenceThreshold: 0.0,
+    keypointConfidenceThreshold: -1,
     enableSmoothing: true,
     maxFps: 30
   }),
-
-  // Validate pose data format
-  validatePoseData: (poseData) => {
-    const errors = [];
-
-    if (!poseData || typeof poseData !== 'object') {
-      errors.push('Pose data must be an object');
-      return { valid: false, errors };
-    }
-
-    if (!Array.isArray(poseData.persons)) {
-      errors.push('Pose data must contain a persons array');
-    }
-
-    return {
-      valid: errors.length === 0,
-      errors
-    };
-  }
+  validatePoseData: (d) => ({
+    valid: d && Array.isArray(d.persons),
+    errors: d && Array.isArray(d.persons) ? [] : ['persons must be an array']
+  })
 };

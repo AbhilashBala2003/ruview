@@ -35,6 +35,13 @@ export function findRepoRoot(start = process.cwd()) {
 // Dep-free PATH scan (ADR-263 O8) — no shell subprocess per lookup. Only hits
 // are memoized: a miss can resolve later in a long-lived MCP session (the
 // operator installs python/the CLI mid-run), so misses are re-probed each call.
+//
+// On Windows, the Microsoft Store app-execution aliases live in
+// %LOCALAPPDATA%\Microsoft\WindowsApps and appear as valid executables on PATH,
+// but they are stubs that immediately exit with a non-zero code when Python is
+// not actually installed from the Store. Skip them so that `which('python')` /
+// `which('python3')` returns null on machines where only the stub exists.
+const WINDOWS_STORE_PATH_FRAGMENT = 'Microsoft\\WindowsApps';
 const whichCache = new Map();
 export function which(cmd) {
   if (whichCache.has(cmd)) return whichCache.get(cmd);
@@ -46,6 +53,8 @@ export function which(cmd) {
   outer:
   for (const dir of (process.env.PATH || '').split(delimiter)) {
     if (!dir) continue;
+    // Skip Windows Store app-execution alias stubs — they are not real interpreters.
+    if (isWin && dir.includes(WINDOWS_STORE_PATH_FRAGMENT)) continue;
     for (const ext of isWin ? ['', ...exts] : exts) {
       const p = join(dir, cmd + ext);
       try {

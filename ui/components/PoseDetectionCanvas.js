@@ -1,6 +1,6 @@
 // PoseDetectionCanvas Component for WiFi-DensePose UI
 
-import { PoseRenderer } from '../utils/pose-renderer.js';
+import { PoseRenderer } from '../utils/pose-renderer.js?v=20260710b';
 import { poseService } from '../services/pose.service.js';
 import { SettingsPanel } from './SettingsPanel.js';
 
